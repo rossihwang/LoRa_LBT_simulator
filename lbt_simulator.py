@@ -2,6 +2,7 @@
 import time
 import random 
 import math 
+import logging
 import numpy as np 
 import matplotlib.pyplot as plt 
 
@@ -10,13 +11,19 @@ import matplotlib.pyplot as plt
 # 2. Packet period model
 
 ## TODO
-# Add power lost model
+# Add path lost model?
 # 
 
 ## Configuration
-RAND_DELAY = 10000  + random.randint(-5000, 5000)
-RETRY_NUM = 3
+RAND_DELAY = 5000  + random.randint(-4000, 4000)
+RETRY_NUM = 5
 SAMPLE_TIME = 1000 + random.randint(-100, 100)
+
+
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s') # %(asctime)s 
+logging.debug("Debug On")
+logging.info("Info On")
 
 class Channel():
     def __init__(self, desc):
@@ -68,20 +75,24 @@ class Node():
         self.successCount = 0
         self.suspendCount = 0
         self.retryCount = 0
+        self.randTicks = random.randint(-10000, 10000)
+
+
+        self.position = (0, 0)
 
     def start_send(self, globalTicks):
         if self.channel.is_busy() == False:
-            print("Tick {}: Node {} starts to send".format(globalTicks/1000, self.devId))
+            logging.debug("Tick {}: Node {} starts to send".format(globalTicks/1000, self.devId))
             self.state = "sending"
             self.startTicks = globalTicks
             self.channel.occupy(self.devId)
             self.successCount += 1
         else:
-            print("Tick {}: Node {} is suspended".format(globalTicks/1000, self.devId))
+            logging.debug("Tick {}: Node {} is suspended".format(globalTicks/1000, self.devId))
             self.retryCount += 1
             self.startTicks = globalTicks
             if self.retryCount < RETRY_NUM:
-                self.state = "stuck"
+                self.state = "suspend"
                 self.suspendCount += 1
                 self.delayTicks = RAND_DELAY
             else:
@@ -89,12 +100,13 @@ class Node():
                 self.state = "wait" 
 
     def end_send(self, globalTicks):
-        print("Tick {}: Node {} ends sending".format(globalTicks/1000, self.devId))
+        logging.debug("Tick {}: Node {} ends sending".format(globalTicks/1000, self.devId))
         self.state = "wait"
         self.startTicks = globalTicks
         self.channel.release(self.devId)
     
     def sample(self, globalTicks):
+        logging.debug("Tick {}: Node {} starts sampling".format(globalTicks/1000, self.devId))
         self.retryCount = 0
         self.startTicks = globalTicks
         self.state = "sampling"
@@ -104,7 +116,7 @@ class Node():
         State machine: (wait) -> (sampling) -> (sending) -> (wait)
                                       |            ^
                                       v            |    
-                                   (stuck)  ->     |
+                                  (suspend) ->     |
                                       ^            |
                                       |     <-     v
         '''
@@ -112,12 +124,12 @@ class Node():
             if globalTicks - self.startTicks >= self.occupyTicks:
                 self.end_send(globalTicks) 
         elif self.state == "wait":
-            if globalTicks - self.startTicks >= self.periodTicks:
+            if globalTicks - self.startTicks >= (self.periodTicks + self.randTicks):
                 self.sample(globalTicks)
         elif self.state == "sampling":
             if globalTicks - self.startTicks >= SAMPLE_TIME:
                 self.start_send(globalTicks)
-        elif self.state == "stuck":
+        elif self.state == "suspend":
             if globalTicks - self.startTicks >= self.delayTicks:
                 self.start_send(globalTicks)
 
@@ -183,50 +195,71 @@ class LoRaPacket():
             raise ValueError("Value for code rate is out of range")
         self.Tsym = (2**self.sf) / self.bw # Symbol rate 
 
-    def get_time(self, preamble=8, header=0, payload=0, crc=2, ldro=0):
+    def get_time(self, preamble=8, header=1, payload=0, crc=2, ldro=0):
+        '''
+        payload: 1 to 255
+        sf: 6 to 12
+        header: 0 or 1, 0 header enable
+        crc
+        '''
         Tpreamble = (preamble+4.25) * self.Tsym
         temp = math.ceil((8*payload-4*self.sf+28+16*crc-20*header)/(4 * (self.sf-2*ldro)))*(self.cr+4)
         Npl = 8 + max(temp, 0)
         Tpacket = Tpreamble + Npl * self.Tsym
         return Tpacket
 
+class PathLostModel():
+    pass 
+
 def plot_hist(lst):
-    plt.hist(lst, bins=np.arange(0, lst.max()+2), normed=True)
+    plt.hist(lst, bins=np.arange(0, lst.max()+2))
+    plt.show()
+
+def test(sf, numOfNodes):
+    
+    t = numOfNodes
+    colors = "bgrcmyk"
+
+    for i, s in enumerate(sf):
+        packet = LoRaPacket(sf=s)
+        tp = int(packet.get_time(payload=255) * 1000) # Tperiod
+        result = []
+        for j in numOfNodes:
+            try:
+                ch1 = Channel("Channel 1")
+                Node.globalDevList = []
+                for k in range(0, j):
+                    ch1.add_node(Node(k, 60000, tp, ch1)) # period:60s
+                chList = [ch1]
+                model = LBT_Model(chList)
+                model.run() 
+            except KeyboardInterrupt:
+                # for c in chList:
+                #     for i, n in enumerate(c.nodeList):
+                #         logging.info("Node {}: success times {}, fail times {}, suspend times {}".format(i, n.successCount, n.failCount, n.suspendCount))
+
+                fail = np.array([n.failCount for c in chList for n in c.nodeList])
+                success = np.array([n.successCount for c in chList for n in c.nodeList])
+                suspend = np.array([n.suspendCount for c in chList for n in c.nodeList])
+
+                failMu = np.mean(fail)
+                successMu = np.mean(success)
+                suspendMu = np.mean(suspend)
+
+                successRate = successMu / (successMu + suspendMu)
+                failRate = failMu / (successMu + suspendMu)
+                logging.info("Success rate: {}, fail rate: {}".format(successRate, failRate))
+                # plot_hist(failList)
+                logging.info("Tperiod: {}".format(tp))
+                result.append(successRate)
+        resultAr = np.array(result)
+        plt.plot(t, resultAr, color=colors[i])
+        plt.ylim(0, 1.2)
+
     plt.show()
 
 def main():
-    # packet = LoRaPacket(sf=9)
-    # tp = int(packet.get_time(payload=255) * 1000)
-
-    # try:
-    #     ch1 = Channel("Channel 1")
-    #     for i in range(40):
-    #         ch1.add_node(Node(i, 60000, tp, ch1)) # period:60s
-    #     chList = [ch1]
-    #     model = LBT_Model(chList)
-    #     model.run() 
-    # except KeyboardInterrupt:
-    #     for i, n in enumerate(ch1.nodeList):
-    #         print("Node {}: success times {}, fail times {}".format(i, n.successCount, n.failCount))
-    #     print(tp)
-
-    packet = LoRaPacket(sf=10)
-    tp = int(packet.get_time(payload=255) * 1000)
-
-    try:
-        ch1 = Channel("Channel 1")
-        for i in range(0, 10):
-            ch1.add_node(Node(i, 60000, tp, ch1)) # period:60s
-        chList = [ch1]
-        model = LBT_Model(chList)
-        model.run() 
-    except KeyboardInterrupt:
-        for c in chList:
-            for i, n in enumerate(c.nodeList):
-                print("Node {}: success times {}, fail times {}, suspend times {}".format(i, n.successCount, n.failCount, n.suspendCount))
-
-        # failList = np.array([n.failCount for c in chList for n in c.nodeList])
-        # plot_hist(failList)
+    test(range(7,13), range(1, 21))
 
 if __name__ == "__main__":
     main()
