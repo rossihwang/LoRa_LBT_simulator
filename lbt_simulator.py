@@ -2,6 +2,21 @@
 import time
 import random 
 import math 
+import numpy as np 
+import matplotlib.pyplot as plt 
+
+## Features
+# 1.LBT model
+# 2. Packet period model
+
+## TODO
+# Add power lost model
+# 
+
+## Configuration
+RAND_DELAY = 10000  + random.randint(-5000, 5000)
+RETRY_NUM = 3
+SAMPLE_TIME = 1000 + random.randint(-100, 100)
 
 class Channel():
     def __init__(self, desc):
@@ -51,6 +66,8 @@ class Node():
         self.state = "wait"
         self.failCount = 0
         self.successCount = 0
+        self.suspendCount = 0
+        self.retryCount = 0
 
     def start_send(self, globalTicks):
         if self.channel.is_busy() == False:
@@ -60,11 +77,16 @@ class Node():
             self.channel.occupy(self.devId)
             self.successCount += 1
         else:
-            print("Tick {}: Node {} is stuck".format(globalTicks/1000, self.devId))
-            self.state = "stuck"
+            print("Tick {}: Node {} is suspended".format(globalTicks/1000, self.devId))
+            self.retryCount += 1
             self.startTicks = globalTicks
-            self.failCount += 1
-            self.delayTicks = 5000 + random.randint(0, 5000) # s
+            if self.retryCount < RETRY_NUM:
+                self.state = "stuck"
+                self.suspendCount += 1
+                self.delayTicks = RAND_DELAY
+            else:
+                self.failCount += 1
+                self.state = "wait" 
 
     def end_send(self, globalTicks):
         print("Tick {}: Node {} ends sending".format(globalTicks/1000, self.devId))
@@ -72,12 +94,28 @@ class Node():
         self.startTicks = globalTicks
         self.channel.release(self.devId)
     
+    def sample(self, globalTicks):
+        self.retryCount = 0
+        self.startTicks = globalTicks
+        self.state = "sampling"
+
     def update(self, globalTicks):
+        '''
+        State machine: (wait) -> (sampling) -> (sending) -> (wait)
+                                      |            ^
+                                      v            |    
+                                   (stuck)  ->     |
+                                      ^            |
+                                      |     <-     v
+        '''
         if self.state == "sending":
             if globalTicks - self.startTicks >= self.occupyTicks:
                 self.end_send(globalTicks) 
         elif self.state == "wait":
             if globalTicks - self.startTicks >= self.periodTicks:
+                self.sample(globalTicks)
+        elif self.state == "sampling":
+            if globalTicks - self.startTicks >= SAMPLE_TIME:
                 self.start_send(globalTicks)
         elif self.state == "stuck":
             if globalTicks - self.startTicks >= self.delayTicks:
@@ -104,7 +142,7 @@ class LBT_Model():
         self.counter = Counter()
         self.chList = chList
 
-    def run(self, stopTicks=600000):
+    def run(self, stopTicks=600000): # 10mins
         while True:
             for c in self.chList:
                 for n in c.nodeList:
@@ -152,6 +190,10 @@ class LoRaPacket():
         Tpacket = Tpreamble + Npl * self.Tsym
         return Tpacket
 
+def plot_hist(lst):
+    plt.hist(lst, bins=np.arange(0, lst.max()+2), normed=True)
+    plt.show()
+
 def main():
     # packet = LoRaPacket(sf=9)
     # tp = int(packet.get_time(payload=255) * 1000)
@@ -168,24 +210,23 @@ def main():
     #         print("Node {}: success times {}, fail times {}".format(i, n.successCount, n.failCount))
     #     print(tp)
 
-    packet = LoRaPacket(sf=9)
+    packet = LoRaPacket(sf=10)
     tp = int(packet.get_time(payload=255) * 1000)
 
     try:
         ch1 = Channel("Channel 1")
-        ch2 = Channel("Channel 2")
-        for i in range(0, 20):
+        for i in range(0, 10):
             ch1.add_node(Node(i, 60000, tp, ch1)) # period:60s
-        for i in range(20, 40):
-            ch2.add_node(Node(i, 60000, tp, ch2))
-        chList = [ch1, ch2]
+        chList = [ch1]
         model = LBT_Model(chList)
         model.run() 
     except KeyboardInterrupt:
         for c in chList:
             for i, n in enumerate(c.nodeList):
-                print("Node {}: success times {}, fail times {}".format(i, n.successCount, n.failCount))
-        print(tp)
+                print("Node {}: success times {}, fail times {}, suspend times {}".format(i, n.successCount, n.failCount, n.suspendCount))
+
+        # failList = np.array([n.failCount for c in chList for n in c.nodeList])
+        # plot_hist(failList)
 
 if __name__ == "__main__":
     main()
